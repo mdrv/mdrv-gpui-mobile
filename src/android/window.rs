@@ -1061,7 +1061,7 @@ impl AndroidWindow {
             preferred_present_mode: Some(wgpu::PresentMode::Mailbox),
         };
 
-        WgpuRenderer::new(gpu_context, &raw, config, None)
+        WgpuRenderer::new(gpu_context, &raw, config, None, None)
     }
 }
 
@@ -1245,9 +1245,10 @@ impl PlatformWindow for AndroidPlatformWindow {
         None
     }
 
-    fn activate(&self) {
+    fn activate(&self, _token: Option<&str>) -> bool {
         // Android windows are always "active" when in the foreground.
         // The system manages window activation via the activity lifecycle.
+        true
     }
 
     fn is_active(&self) -> bool {
@@ -1823,10 +1824,6 @@ impl PlatformWindow for AndroidPlatformWindow {
         );
 
         self.window.draw(scene);
-    }
-
-    fn completed_frame(&self) {
-        // No-op — frame completion is handled by wgpu's present.
     }
 
     fn sprite_atlas(&self) -> Arc<dyn PlatformAtlas> {

@@ -146,7 +146,7 @@ struct AndroidPlatformState {
     finish_launching: Option<Box<dyn FnOnce() + Send>>,
 
     /// Called when the app is about to quit.
-    quit_callback: Option<Box<dyn FnMut() + Send>>,
+    quit_callback: Option<Box<dyn FnMut() -> bool + Send>>,
 
     /// Called when the app is re-opened (e.g. tapped in the recents screen
     /// while already running).
@@ -519,13 +519,17 @@ impl AndroidPlatform {
 
         let cb = self.state.lock().quit_callback.as_mut().map(|cb| {
             // We cannot move out of an `&mut FnMut`, so we call it in place.
-            cb as *mut Box<dyn FnMut() + Send>
+            cb as *mut Box<dyn FnMut() -> bool + Send>
         });
 
         if let Some(cb_ptr) = cb {
             // SAFETY: The pointer is valid for the duration of this call
             // because we hold the lock-guard's lifetime indirectly.
-            unsafe { (*cb_ptr)() };
+            unsafe {
+                // gpui-ce: the callback returns whether the quit may proceed;
+                // the Android main loop honours `should_quit` either way.
+                let _ = (*cb_ptr)();
+            };
         }
     }
 
@@ -895,7 +899,7 @@ impl AndroidPlatform {
     /// Register a callback invoked when the app is about to quit.
     pub fn on_quit<F>(&self, cb: F)
     where
-        F: FnMut() + Send + 'static,
+        F: FnMut() -> bool + Send + 'static,
     {
         self.state.lock().quit_callback = Some(Box::new(cb));
     }
@@ -983,7 +987,7 @@ impl Platform for AndroidPlatform {
             .lock()
             .quit_callback
             .as_mut()
-            .map(|cb| cb as *mut Box<dyn FnMut() + Send>);
+            .map(|cb| cb as *mut Box<dyn FnMut() -> bool + Send>);
 
         if let Some(cb_ptr) = cb {
             // SAFETY: pointer is valid for the duration of this call because
@@ -992,7 +996,7 @@ impl Platform for AndroidPlatform {
         }
     }
 
-    fn restart(&self, _binary_path: Option<PathBuf>) {
+    fn restart(&self, _binary_path: Option<PathBuf>, _arguments: Vec<std::ffi::OsString>) {
         log::warn!("AndroidPlatform::restart — not supported on Android");
     }
 
@@ -1122,10 +1126,24 @@ impl Platform for AndroidPlatform {
         log::info!("AndroidPlatform::open_with_system — Intent launch not yet implemented");
     }
 
-    fn on_quit(&self, callback: Box<dyn FnMut()>) {
+    fn on_quit(&self, callback: Box<dyn FnMut() -> bool>) {
         self.state.lock().quit_callback = Some(unsafe {
-            std::mem::transmute::<Box<dyn FnMut()>, Box<dyn FnMut() + Send>>(callback)
+            std::mem::transmute::<Box<dyn FnMut() -> bool>, Box<dyn FnMut() -> bool + Send>>(
+                callback,
+            )
         });
+    }
+
+    fn on_system_wake(&self, _callback: Box<dyn FnMut()>) {
+        // Android has no desktop "system wake" event.
+    }
+
+    fn hide_cursor_until_mouse_moves(&self) {
+        // Touch-first platform — no cursor to hide.
+    }
+
+    fn is_cursor_visible(&self) -> bool {
+        false
     }
 
     fn on_reopen(&self, callback: Box<dyn FnMut()>) {
@@ -1307,8 +1325,8 @@ impl Platform for SharedPlatform {
     fn quit(&self) {
         <AndroidPlatform as Platform>::quit(&self.0)
     }
-    fn restart(&self, binary_path: Option<PathBuf>) {
-        <AndroidPlatform as Platform>::restart(&self.0, binary_path)
+    fn restart(&self, binary_path: Option<PathBuf>, arguments: Vec<std::ffi::OsString>) {
+        <AndroidPlatform as Platform>::restart(&self.0, binary_path, arguments)
     }
     fn activate(&self, ignoring_other_apps: bool) {
         <AndroidPlatform as Platform>::activate(&self.0, ignoring_other_apps)
@@ -1372,8 +1390,17 @@ impl Platform for SharedPlatform {
     fn open_with_system(&self, path: &Path) {
         <AndroidPlatform as Platform>::open_with_system(&self.0, path)
     }
-    fn on_quit(&self, callback: Box<dyn FnMut()>) {
+    fn on_quit(&self, callback: Box<dyn FnMut() -> bool>) {
         <AndroidPlatform as Platform>::on_quit(&self.0, callback)
+    }
+    fn on_system_wake(&self, callback: Box<dyn FnMut()>) {
+        <AndroidPlatform as Platform>::on_system_wake(&self.0, callback)
+    }
+    fn hide_cursor_until_mouse_moves(&self) {
+        <AndroidPlatform as Platform>::hide_cursor_until_mouse_moves(&self.0)
+    }
+    fn is_cursor_visible(&self) -> bool {
+        <AndroidPlatform as Platform>::is_cursor_visible(&self.0)
     }
     fn on_reopen(&self, callback: Box<dyn FnMut()>) {
         <AndroidPlatform as Platform>::on_reopen(&self.0, callback)
@@ -1491,6 +1518,7 @@ mod tests {
         let f2 = fired.clone();
         p.on_quit(move || {
             f2.store(true, Ordering::Relaxed);
+            true
         });
         p.quit();
         assert!(fired.load(Ordering::Relaxed));
