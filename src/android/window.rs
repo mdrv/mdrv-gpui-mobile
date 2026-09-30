@@ -1251,6 +1251,15 @@ impl PlatformWindow for AndroidPlatformWindow {
         true
     }
 
+    fn gpu_context_info(&self) -> Option<Box<dyn std::any::Any>> {
+        let state = self.window.state.lock();
+        state
+            .renderer
+            .as_ref()?
+            .gpu_context_info()
+            .map(|handle| Box::new(handle) as Box<dyn std::any::Any>)
+    }
+
     fn is_active(&self) -> bool {
         self.window.is_active()
     }
