@@ -35,7 +35,7 @@
 //! // When step() returns None the fling is finished.
 //! ```
 
-use std::time::Instant;
+use web_time::Instant;
 
 // ── Configuration ────────────────────────────────────────────────────────────
 

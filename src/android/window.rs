@@ -37,6 +37,7 @@ use futures::channel::oneshot;
 use gpui::{
     self, AtlasKey, AtlasTile, Capslock, DispatchEventResult, GpuSpecs, Modifiers, PlatformAtlas,
     PlatformDisplay, PlatformInputHandler, PlatformWindow, PromptButton, PromptLevel,
+    TextInputStateChange,
     RequestFrameOptions, WindowBackgroundAppearance, WindowBounds, WindowControlArea,
 };
 use gpui_wgpu::{wgpu, GpuContext, WgpuRenderer, WgpuSurfaceConfig};
@@ -346,6 +347,34 @@ pub struct AndroidWindow {
 unsafe impl Send for AndroidWindow {}
 unsafe impl Sync for AndroidWindow {}
 
+// Paint-cost diagnostics. This device's MIUI ROM ships with logd disabled
+// (logcat is always empty), so frame timing is published through these
+// atomics instead of the log crate; the app HUD reads `last_draw_stats()`.
+static DRAW_MS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+static DRAW_COUNT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// Set by gpui's "I need a frame" hooks (`schedule_frame` / `frame_waker`
+/// below). The main loop in `jni.rs` only calls `request_frame` when this is
+/// set, so idle windows cost zero GPU work instead of re-presenting the same
+/// scene every 0.5 ms.
+pub(crate) static FRAME_SCHEDULED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Force one frame request (e.g. right after the surface was (re)created).
+pub(crate) fn schedule_frame_now() {
+    FRAME_SCHEDULED.store(true, std::sync::atomic::Ordering::Release);
+}
+
+/// `(last full-frame paint duration in ms, frames painted since start)` —
+/// for on-screen performance HUDs.
+pub fn last_draw_stats() -> (u32, u32) {
+    use std::sync::atomic::Ordering;
+    (
+        DRAW_MS.load(Ordering::Relaxed),
+        DRAW_COUNT.load(Ordering::Relaxed),
+    )
+}
+
 impl AndroidWindow {
     // ── constructors ─────────────────────────────────────────────────────────
 
@@ -399,7 +428,14 @@ impl AndroidWindow {
             height,
             scale_factor,
             safe_area_insets: SafeAreaInsets::default(),
-            appearance: WindowAppearance::Light,
+            // Seed from the real system setting: `set_appearance` only fires
+            // the change callback on an actual value edge, so a stale default
+            // would swallow the first OS theme toggle (no live re-theme).
+            appearance: if crate::android::jni::query_night_mode_via_jni() {
+                WindowAppearance::Dark
+            } else {
+                WindowAppearance::Light
+            },
             is_active: true,
             transparent,
             request_frame_callback: None,
@@ -651,6 +687,20 @@ impl AndroidWindow {
     ///   and the next frame callback produces an empty scene.
     /// - Intermittently during fast scrolling if the layout pass
     ///   hasn't produced new content yet.
+    /// Applies a new render scale to this window's renderer (reconfigures the
+    /// surface at the stored logical size). Safe to call at any time; no-op
+    /// before the renderer exists.
+    pub fn set_render_scale(&self, scale: f32) {
+        // Take the renderer out of the state lock first: reconfiguring can
+        // block on device.poll, and other code paths lock `state` around
+        // renderer access (same pattern as handle_resize / draw).
+        let renderer = self.state.lock().renderer.take();
+        if let Some(mut renderer) = renderer {
+            renderer.set_render_scale(scale);
+            self.state.lock().renderer = Some(renderer);
+        }
+    }
+
     pub fn draw(&self, scene: &gpui::Scene) {
         // Skip only truly empty scenes. Text and images are emitted as sprite
         // primitives, not quads, so checking `scene.quads` alone can drop
@@ -675,7 +725,15 @@ impl AndroidWindow {
             }
         };
 
+        // Frame-time instrumentation: publish paint cost via the module-level
+        // atomics (see `last_draw_stats`) — logd is disabled on the device.
+        let t0 = std::time::Instant::now();
         renderer.draw(scene);
+        DRAW_MS.store(
+            t0.elapsed().as_millis() as u32,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        DRAW_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
         // Put the renderer back.
         let mut state = self.state.lock();
@@ -721,6 +779,10 @@ impl AndroidWindow {
     /// as `request_frame`) to avoid potential deadlocks if the callback
     /// re-enters any window method that needs the lock.
     pub fn handle_touch(&self, point: TouchPoint) {
+        // Track multi-pointer pinch/rotate gestures first (see gesture.rs);
+        // the single-pointer mouse translation below is suppressed by the
+        // touch callback while two fingers are down.
+        let _pinching = crate::android::gesture::track_touch(&point);
         let cb = {
             let mut state = self.state.lock();
             state.touch_callback.take()
@@ -892,6 +954,21 @@ impl AndroidWindow {
     pub fn safe_area_insets_logical(&self) -> SafeAreaInsets {
         let state = self.state.lock();
         state.safe_area_insets.to_logical(state.scale_factor)
+    }
+
+    /// Overwrite the safe-area insets directly (physical pixels).
+    ///
+    /// The JNI side can query `WindowInsets` via the decor view at any time —
+    /// needed on devices where `onContentRectChanged` never delivers real
+    /// bar insets (observed on the Android emulator).
+    pub fn set_safe_area_insets_physical(&self, left: i32, top: i32, right: i32, bottom: i32) {
+        let mut state = self.state.lock();
+        state.safe_area_insets = SafeAreaInsets {
+            top: top as f32,
+            bottom: bottom as f32,
+            left: left as f32,
+            right: right as f32,
+        };
     }
 
     /// Update the safe area insets from the content rect provided by the system.
@@ -1229,6 +1306,24 @@ impl PlatformWindow for AndroidPlatformWindow {
         self.input_handler = Some(input_handler);
     }
 
+    // gpui flips the focused-text-input state each frame; show/hide the soft
+    // keyboard at that edge so a tap on any text input raises the IME (and
+    // losing focus - e.g. tapping outside or cancelling a dialog - lowers it).
+    fn text_input_state_changed(&self, change: TextInputStateChange) {
+        match change {
+            TextInputStateChange::FocusGained => {
+                log::info!("text_input_state_changed: FocusGained -> show keyboard");
+                crate::android::jni::show_keyboard_android(crate::KeyboardType::Default);
+            }
+            TextInputStateChange::FocusLost => {
+                log::info!("text_input_state_changed: FocusLost -> hide keyboard");
+                crate::android::jni::hide_keyboard_android();
+            }
+            TextInputStateChange::SelectionChanged => {}
+            _ => {}
+        }
+    }
+
     fn take_input_handler(&mut self) -> Option<PlatformInputHandler> {
         self.input_handler.take()
     }
@@ -1298,6 +1393,20 @@ impl PlatformWindow for AndroidPlatformWindow {
 
     fn is_fullscreen(&self) -> bool {
         true
+    }
+
+    fn frame_waker(&self) -> Option<std::rc::Rc<dyn Fn()>> {
+        // gpui wakes this when a window becomes dirty (cx.notify()) from
+        // outside the frame handler — our signal for the main loop to paint.
+        Some(std::rc::Rc::new(|| {
+            FRAME_SCHEDULED.store(true, std::sync::atomic::Ordering::Release)
+        }))
+    }
+
+    fn schedule_frame(&self) {
+        // Called at the end of gpui's frame handler while the window is
+        // still dirty or has pending next-frame callbacks (animations).
+        FRAME_SCHEDULED.store(true, std::sync::atomic::Ordering::Release);
     }
 
     fn on_request_frame(&self, callback: Box<dyn FnMut(RequestFrameOptions)>) {
@@ -1498,6 +1607,22 @@ impl PlatformWindow for AndroidPlatformWindow {
                 let logical_y = touch.y / scale_factor;
                 let modifiers = gpui::Modifiers::default();
 
+                // ── Multi-touch suppression ──────────────────────────────
+                // While two or more fingers are down (pinch/rotate gesture,
+                // tracked in gesture.rs), don't feed the single-finger state
+                // machine: the extra pointers would emit spurious taps and
+                // drags. Cancel any in-flight tap/scroll instead.
+                if crate::android::gesture::is_pinching() {
+                    *state.lock() = TouchState::Idle;
+                    let mut ms = momentum.lock();
+                    ms.scroller.cancel();
+                    ms.velocity_tracker.reset();
+                    ms.pending_scroll_dx = 0.0;
+                    ms.pending_scroll_dy = 0.0;
+                    ms.has_pending_scroll = false;
+                    return;
+                }
+
                 let mut ts = state.lock();
 
                 match touch.action {
@@ -1567,6 +1692,13 @@ impl PlatformWindow for AndroidPlatformWindow {
                                         ms.pending_scroll_phase = gpui::TouchPhase::Started;
                                     }
                                     ms.has_pending_scroll = true;
+                                    // Live scrolling: the frame callback drains
+                                    // the accumulator, but with event-driven
+                                    // frame gating an idle window has no frame
+                                    // queued — request one now so the coalesced
+                                    // ScrollWheel goes out immediately instead
+                                    // of piling up until the finger lifts.
+                                    schedule_frame_now();
                                 }
                                 // else: still within slop, stay Pending
                             }
@@ -1585,6 +1717,7 @@ impl PlatformWindow for AndroidPlatformWindow {
                                     ms.pending_scroll_phase = gpui::TouchPhase::Moved;
                                 }
                                 ms.has_pending_scroll = true;
+                                schedule_frame_now();
                             }
                             TouchState::Idle => {
                                 // Spurious move without a preceding down — ignore.
@@ -1703,6 +1836,12 @@ impl PlatformWindow for AndroidPlatformWindow {
                 use crate::android::keyboard::{
                     android_key_to_keystroke, AKEY_EVENT_ACTION_DOWN, AKEY_EVENT_ACTION_UP,
                 };
+                log::info!(
+                    "platform: android key code={} action={} uni={}",
+                    key_event.key_code,
+                    key_event.action,
+                    key_event.unicode_char
+                );
 
                 // On KeyDown, dispatch text through the global callback so
                 // custom TextInput components (PENDING_TEXT) receive it.

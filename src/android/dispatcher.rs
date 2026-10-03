@@ -177,6 +177,11 @@ impl AndroidDispatcher {
             !looper.is_null(),
             "AndroidDispatcher::new() must be called on the Android main thread"
         );
+        log::info!(
+            "AndroidDispatcher::new: looper={:p} thread={:?}",
+            looper,
+            std::thread::current().id()
+        );
 
         let pool_threads = std::thread::available_parallelism()
             .map(|n| n.get())
@@ -242,7 +247,20 @@ impl AndroidDispatcher {
         // registered with.  `ALooper_forThread()` returns the *same* pointer
         // if we're on that thread, or a *different* (or null) pointer otherwise.
         let current = unsafe { ALooper_forThread() };
-        !current.is_null() && current == self.looper
+        let is_main = !current.is_null() && current == self.looper;
+        if !is_main {
+            static MISMATCH_LOG: std::sync::atomic::AtomicUsize =
+                std::sync::atomic::AtomicUsize::new(0);
+            if MISMATCH_LOG.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 3 {
+                log::warn!(
+                    "is_main_thread=false: current={:p} self.looper={:p} thread={:?}",
+                    current,
+                    self.looper,
+                    std::thread::current().id()
+                );
+            }
+        }
+        is_main
     }
 
     /// Enqueue a task to run on the **main** (foreground) thread.

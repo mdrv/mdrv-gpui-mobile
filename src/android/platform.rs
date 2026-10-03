@@ -1071,7 +1071,14 @@ impl Platform for AndroidPlatform {
     }
 
     fn window_appearance(&self) -> WindowAppearance {
-        WindowAppearance::Dark
+        // Follow the real system setting (NDK Configuration uiModeNight) so
+        // apps that default to "system" pick up light/dark correctly; the
+        // ConfigChanged arm re-applies this when the user toggles the OS theme.
+        if crate::android::jni::query_night_mode_via_jni() {
+            WindowAppearance::Dark
+        } else {
+            WindowAppearance::Light
+        }
     }
 
     fn open_url(&self, url: &str) {

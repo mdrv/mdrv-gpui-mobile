@@ -151,6 +151,7 @@ pub fn size<T>(width: T, height: T) -> Size<T> {
 
 pub mod dispatcher;
 pub mod display;
+pub mod gesture;
 pub mod jni;
 pub mod keyboard;
 pub mod platform;
@@ -234,18 +235,57 @@ pub struct TouchPoint {
 
 // ── shared logging helper ─────────────────────────────────────────────────────
 
-/// Initialise `android_logger` so that `log::*` macros route to logcat.
+static FILE_LOG_PATH: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+
+/// Point the file logger at a path (e.g. `<internal-data>/mdrv-lab.log`).
+/// Call before `init_logger`; logcat is unavailable on some ROMs (MIUI).
+pub fn set_log_file(path: std::path::PathBuf) {
+    let _ = FILE_LOG_PATH.set(path);
+}
+
+struct FileLogger;
+
+impl log::Log for FileLogger {
+    fn enabled(&self, metadata: &log::Metadata) -> bool {
+        metadata.level() <= log::Level::Info
+    }
+
+    fn log(&self, record: &log::Record) {
+        if !self.enabled(record.metadata()) {
+            return;
+        }
+        let Some(path) = FILE_LOG_PATH.get() else {
+            return;
+        };
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or(0);
+        let line = format!(
+            "[{stamp}] {:<5} [{}] {}\n",
+            record.level(),
+            record.target(),
+            record.args()
+        );
+        let _ = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .and_then(|mut f| std::io::Write::write_all(&mut f, line.as_bytes()));
+    }
+
+    fn flush(&self) {}
+}
+
+/// Initialise the `log` facade with a file sink (`set_log_file` first).
 ///
 /// Safe to call multiple times — subsequent calls are no-ops.
 pub fn init_logger() {
     use std::sync::OnceLock;
     static INIT: OnceLock<()> = OnceLock::new();
     INIT.get_or_init(|| {
-        android_logger::init_once(
-            android_logger::Config::default()
-                .with_max_level(log::LevelFilter::Info)
-                .with_tag("gpui-android"),
-        );
-        log::info!("gpui-android logger initialised");
+        let _ = log::set_boxed_logger(Box::new(FileLogger));
+        log::set_max_level(log::LevelFilter::Info);
+        log::info!("gpui-android logger initialised (file sink)");
     });
 }

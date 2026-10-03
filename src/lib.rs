@@ -118,6 +118,29 @@ impl Default for SystemChromeStyle {
 /// On Android this calls `Window.setStatusBarColor()`,
 /// `Window.setNavigationBarColor()`, and configures light/dark status bar icons.
 ///
+/// Sets the renderer's render scale (0.25..=1.0; 1.0 = native resolution).
+/// Surfaces are rendered at `scale × logical size` while all layout, scene
+/// coordinates and input positions stay logical, so this trades sharpness for
+/// fill rate without any upstream changes — the main lever on fill-bound
+/// budget GPUs. Applies immediately to the current window; new renderers pick
+/// the value up automatically.
+///
+/// On unsupported platforms this is a no-op.
+pub fn set_render_scale(scale: f32) {
+    #[cfg(target_os = "android")]
+    {
+        if let Some(window) = crate::android::jni::platform()
+            .and_then(|platform| platform.primary_window())
+        {
+            window.set_render_scale(scale);
+        }
+    }
+    #[cfg(not(target_os = "android"))]
+    {
+        let _ = scale;
+    }
+}
+
 /// On unsupported platforms this is a no-op.
 pub fn set_system_chrome(style: &SystemChromeStyle) {
     #[cfg(target_os = "ios")]
@@ -176,6 +199,8 @@ pub fn dispatch_text_input(text: &str) -> bool {
         if let Some(callback) = cb.borrow_mut().as_mut() {
             callback(text);
             TEXT_INPUT_DIRTY.store(true, Ordering::Release);
+            #[cfg(target_os = "android")]
+            crate::android::window::schedule_frame_now();
             true
         } else {
             false
@@ -290,6 +315,8 @@ pub fn set_keyboard_height(height: f32) {
     if (prev - height).abs() > 0.5 {
         KEYBOARD_HEIGHT_BITS.store(height.to_bits(), Ordering::Release);
         TEXT_INPUT_DIRTY.store(true, Ordering::Release);
+        #[cfg(target_os = "android")]
+        crate::android::window::schedule_frame_now();
     }
 }
 

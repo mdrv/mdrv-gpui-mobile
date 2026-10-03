@@ -55,10 +55,11 @@ log          = { version = "0.4", features = ["kv_unstable_serde", "serde"] }
 parking_lot  = "0.12"
 futures      = "0.3"
 raw-window-handle = "0.6"
+web-time     = "1.1"
 
 # ── GPUI core crate (provides Platform trait, event types, geometry, etc.) ───
 # gpui = { path = "/g/gpui-ce/crates/gpui", package = "mdrv-gpui-ce", default-features = false } # DEV form
-gpui = { git = "https://github.com/mdrv/gpui-ce", tag = "mdrv-gpui-0.0.260930.0", package = "mdrv-gpui-ce", default-features = false }
+gpui = { path = "/g/gpui-ce/crates/gpui", package = "mdrv-gpui-ce", default-features = false } # DEV: render-scale work in local worktree
 
 # ── iOS ──────────────────────────────────────────────────────────────────────
 
@@ -76,7 +77,7 @@ block2              = "0.6"
 
 # wgpu renderer (Metal backend on iOS/Android)
 # gpui_wgpu = { path = "/g/gpui-ce/crates/gpui_wgpu", package = "mdrv-gpui-wgpu", features = ["font-kit"] } # DEV form
-gpui_wgpu = { git = "https://github.com/mdrv/gpui-ce", tag = "mdrv-gpui-0.0.260930.0", package = "mdrv-gpui-wgpu", features = ["font-kit"] }
+gpui_wgpu = { path = "/g/gpui-ce/crates/gpui_wgpu", package = "mdrv-gpui-wgpu", features = ["font-kit"] } # DEV: render-scale work in local worktree
 wgpu = "29.0.3"
 
 # Text / font stack
@@ -107,7 +108,7 @@ android_logger = "0.15"
 
 # wgpu renderer (Vulkan backend on Android)
 # gpui_wgpu = { path = "/g/gpui-ce/crates/gpui_wgpu", package = "mdrv-gpui-wgpu" } # DEV form
-gpui_wgpu = { git = "https://github.com/mdrv/gpui-ce", tag = "mdrv-gpui-0.0.260930.0", package = "mdrv-gpui-wgpu" }
+gpui_wgpu = { path = "/g/gpui-ce/crates/gpui_wgpu", package = "mdrv-gpui-wgpu" } # DEV: render-scale work in local worktree
 
 # rustc-hash is required by the PlatformKeyboardMapper trait signature
 rustc-hash = "2"

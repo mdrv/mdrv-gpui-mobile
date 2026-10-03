@@ -438,7 +438,10 @@ fn process_input_events(app: &AndroidApp) {
                                         if i != motion_event.pointer_index() {
                                             continue;
                                         }
-                                        AMOTION_EVENT_ACTION_DOWN
+                                        // Real ACTION_POINTER_DOWN code: gesture.rs uses
+                                        // this to distinguish additional fingers from the
+                                        // first one (plain ACTION_DOWN).
+                                        5
                                     }
                                     MotionAction::Up => AMOTION_EVENT_ACTION_UP,
                                     MotionAction::PointerUp => {
@@ -446,7 +449,8 @@ fn process_input_events(app: &AndroidApp) {
                                         if i != motion_event.pointer_index() {
                                             continue;
                                         }
-                                        AMOTION_EVENT_ACTION_UP
+                                        // Real ACTION_POINTER_UP code.
+                                        6
                                     }
                                     MotionAction::Move => AMOTION_EVENT_ACTION_MOVE,
                                     MotionAction::Cancel => AMOTION_EVENT_ACTION_UP,
@@ -480,6 +484,34 @@ fn process_input_events(app: &AndroidApp) {
                             };
 
                             let key_code: u32 = key_event.key_code().into();
+
+                            // System keys stay with the OS: VOLUME_UP/DOWN/MUTE adjust the
+                            // media volume (and show the volume pill), BACK backgrounds the
+                            // activity. Swallowing them here made the volume buttons dead
+                            // inside apps; android-activity hands unhandled key events to the
+                            // framework's default handling.
+                            match key_code {
+                                24 | 25 | 164 => {
+                                    log::trace!(
+                                        "dispatch_key_event: code={} → system key, unhandled",
+                                        key_code
+                                    );
+                                    return android_activity::InputStatus::Unhandled;
+                                }
+                                // BACK: stays with the OS by default; apps can
+                                // opt in to receiving it as a gpui "escape"
+                                // keystroke (keyboard.rs already maps
+                                // AKEYCODE_BACK → "escape") for in-app back
+                                // navigation.
+                                4 if !back_sends_escape() => {
+                                    log::trace!(
+                                        "dispatch_key_event: code=4 → system back, unhandled"
+                                    );
+                                    return android_activity::InputStatus::Unhandled;
+                                }
+                                _ => {}
+                            }
+
                             let meta_state: u32 = key_event.meta_state().0;
 
                             let unicode_char = unicode_char_for_key_event(
@@ -505,6 +537,11 @@ fn process_input_events(app: &AndroidApp) {
                                 unicode_char,
                             };
 
+                            log::info!(
+                                "jni: forwarding key code={} action={} uni={unicode_char} to window",
+                                key_code,
+                                key_event.action,
+                            );
                             win.handle_key_event(key_event);
                             android_activity::InputStatus::Handled
                         }
@@ -651,6 +688,7 @@ pub fn run_event_loop(app: &AndroidApp) {
                         existing.update_safe_area_from_content_rect(
                             cr.left, cr.top, cr.right, cr.bottom,
                         );
+                        crate::android::jni::refresh_system_bar_insets();
 
                         INIT_WINDOW_DONE.store(true, Ordering::Relaxed);
                     } else {
@@ -666,6 +704,7 @@ pub fn run_event_loop(app: &AndroidApp) {
                                 win.update_safe_area_from_content_rect(
                                     cr.left, cr.top, cr.right, cr.bottom,
                                 );
+                                crate::android::jni::refresh_system_bar_insets();
                             }
                             Err(e) => {
                                 log::error!("failed to open window: {e:#}");
@@ -686,6 +725,7 @@ pub fn run_event_loop(app: &AndroidApp) {
                     win.handle_resize();
                     let cr = app.content_rect();
                     win.update_safe_area_from_content_rect(cr.left, cr.top, cr.right, cr.bottom);
+                    crate::android::jni::refresh_system_bar_insets();
                 }
             }
         }
@@ -785,7 +825,14 @@ pub fn run_event_loop(app: &AndroidApp) {
             if INIT_WINDOW_DONE.load(Ordering::Relaxed) && app_is_active {
                 platform.flush_main_thread_tasks();
                 if let Some(win) = platform.primary_window() {
-                    win.request_frame();
+                    // Event-driven frame gating: gpui schedules frames via
+                    // `schedule_frame`/`frame_waker` (window.rs
+                    // `FRAME_SCHEDULED`); idle windows now cost zero GPU.
+                    if super::window::FRAME_SCHEDULED
+                        .swap(false, std::sync::atomic::Ordering::AcqRel)
+                    {
+                        win.request_frame();
+                    }
                 }
 
                 // Drain lifecycle events that arrived during rendering
@@ -859,6 +906,10 @@ fn handle_main_event(_app: &AndroidApp, event: MainEvent<'_>) {
             log::info!("MainEvent::InitWindow");
             // Defer to after poll_events to avoid deadlock with state lock.
             INIT_WINDOW_PENDING.store(true, Ordering::Relaxed);
+            // Fresh/recreated surface: schedule a frame so the window shows
+            // content immediately (event-driven gating otherwise waits for
+            // input → blank until touched after Recents).
+            super::window::schedule_frame_now();
         }
 
         MainEvent::TerminateWindow { .. } => {
@@ -871,11 +922,13 @@ fn handle_main_event(_app: &AndroidApp, event: MainEvent<'_>) {
             log::debug!("MainEvent::WindowResized");
             // Defer to after poll_events to avoid deadlock with state lock.
             WINDOW_RESIZED_PENDING.store(true, Ordering::Relaxed);
+            super::window::schedule_frame_now();
         }
 
         MainEvent::GainedFocus => {
             log::info!("MainEvent::GainedFocus");
             RESUME_PENDING.store(true, Ordering::Relaxed);
+            super::window::schedule_frame_now();
         }
 
         MainEvent::LostFocus => {
@@ -886,6 +939,8 @@ fn handle_main_event(_app: &AndroidApp, event: MainEvent<'_>) {
         MainEvent::Resume { .. } => {
             log::info!("MainEvent::Resume");
             RESUME_PENDING.store(true, Ordering::Relaxed);
+            // Recents-return renders blank until touched without this.
+            super::window::schedule_frame_now();
         }
 
         MainEvent::Pause => {
@@ -1131,9 +1186,12 @@ pub fn set_system_chrome(style: &crate::SystemChromeStyle) {
         if let Ok(v) = insetsctl {
             if let Ok(ctl) = v.l() {
                 if !ctl.is_null() {
-                    let mask: i32 = 0x00000008;
+                    // APPEARANCE_LIGHT_STATUS_BARS (0x8) and
+                    // APPEARANCE_LIGHT_NAVIGATION_BARS (0x10): set together so
+                    // gesture-nav handles get dark icons on light themes too.
+                    let mask: i32 = 0x00000018;
                     let appearance: i32 = match status_bar_style {
-                        crate::StatusBarContentStyle::Dark => 0x00000008,
+                        crate::StatusBarContentStyle::Dark => 0x00000018,
                         crate::StatusBarContentStyle::Light => 0,
                     };
                     let _ = env.call_method(
@@ -1168,8 +1226,12 @@ pub fn set_system_chrome(style: &crate::SystemChromeStyle) {
                         .and_then(|v: jni::objects::JValueOwned| v.i())
                     {
                         let new_flags = match status_bar_style {
-                            crate::StatusBarContentStyle::Dark => current | 0x00002000,
-                            crate::StatusBarContentStyle::Light => current & !0x00002000,
+                            crate::StatusBarContentStyle::Dark => {
+                                current | 0x00002000 | 0x00008000
+                            }
+                            crate::StatusBarContentStyle::Light => {
+                                current & !(0x00002000 | 0x00008000)
+                            }
                         };
                         let _ = env.call_method(
                             &decor,
@@ -1369,5 +1431,147 @@ mod tests {
     #[test]
     fn platform_returns_none_before_init() {
         assert!(platform().is_none());
+    }
+}
+
+// ── System bar insets (direct WindowInsets query) ────────────────────────────
+
+/// Query one `()I` getter off a JNI object.
+fn insets_edge_i(
+    env: &mut jni::Env,
+    obj: &jni::objects::JObject,
+    name: &str,
+) -> Result<i32, String> {
+    env.call_method(
+        obj,
+        jni::strings::JNIString::from(name),
+        jni::jni_sig!("()I"),
+        &[],
+    )
+    .and_then(|v| v.i())
+    .map_err(|e| e.to_string())
+}
+
+/// Query the system bar (status + navigation) insets in physical pixels
+/// straight from the decor view's `WindowInsets`. Unlike the
+/// `onContentRectChanged` path, this works on devices/emulators where that
+/// callback never delivers real values.
+pub fn system_bar_insets_physical() -> Option<(i32, i32, i32, i32)> {
+    with_env(|env| {
+        let act = activity(env)?;
+        let window = env
+            .call_method(
+                &act,
+                jni::jni_str!("getWindow"),
+                jni::jni_sig!("()Landroid/view/Window;"),
+                &[],
+            )
+            .and_then(|v| v.l())
+            .map_err(|e| e.to_string())?;
+        let decor = env
+            .call_method(
+                &window,
+                jni::jni_str!("getDecorView"),
+                jni::jni_sig!("()Landroid/view/View;"),
+                &[],
+            )
+            .and_then(|v| v.l())
+            .map_err(|e| e.to_string())?;
+        let insets = env
+            .call_method(
+                &decor,
+                jni::jni_str!("getRootWindowInsets"),
+                jni::jni_sig!("()Landroid/view/WindowInsets;"),
+                &[],
+            )
+            .and_then(|v| v.l())
+            .map_err(|e| e.to_string())?;
+        // getSystemWindowInsets() is API 29+; fall back to the per-edge
+        // getters (API 14+) on older devices.
+        fn legacy_insets(
+            env: &mut jni::Env,
+            insets: &jni::objects::JObject,
+        ) -> Result<(i32, i32, i32, i32), String> {
+            Ok((
+                insets_edge_i(env, insets, "getSystemWindowInsetLeft")?,
+                insets_edge_i(env, insets, "getSystemWindowInsetTop")?,
+                insets_edge_i(env, insets, "getSystemWindowInsetRight")?,
+                insets_edge_i(env, insets, "getSystemWindowInsetBottom")?,
+            ))
+        }
+        match env
+            .call_method(
+                &insets,
+                jni::jni_str!("getSystemWindowInsets"),
+                jni::jni_sig!("()Landroid/graphics/Insets;"),
+                &[],
+            )
+            .and_then(|v| v.l())
+        {
+            Ok(sys) => {
+                match (
+                    insets_edge_i(env, &sys, "left"),
+                    insets_edge_i(env, &sys, "top"),
+                    insets_edge_i(env, &sys, "right"),
+                    insets_edge_i(env, &sys, "bottom"),
+                ) {
+                    (Ok(l), Ok(t), Ok(r), Ok(b)) => Ok(Some((l, t, r, b))),
+                    _ => legacy_insets(env, &insets).map(Some),
+                }
+            }
+            Err(_) => legacy_insets(env, &insets).map(Some),
+        }
+    })
+    .ok()
+    .flatten()
+}
+
+/// Query the current system-bar insets and store them on the primary window
+/// (physical pixels). Returns true when fresh values were applied.
+pub fn refresh_system_bar_insets() -> bool {
+    let Some(platform) = PLATFORM.get() else {
+        return false;
+    };
+    let Some(win) = platform.primary_window() else {
+        return false;
+    };
+    match system_bar_insets_physical() {
+        Some((l, t, r, b)) => {
+            win.set_safe_area_insets_physical(l, t, r, b);
+            log::info!("system bar insets: l={l} t={t} r={r} b={b}");
+            true
+        }
+        None => false,
+    }
+}
+
+// ── Hardware BACK key routing ────────────────────────────────────────────────
+
+static BACK_SENDS_ESCAPE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Opt in to receiving the Android BACK key as a gpui `"escape"` keystroke
+/// (instead of the OS backgrounding the activity). Apps use it for in-app
+/// back navigation / quit confirmations.
+pub fn set_back_sends_escape(on: bool) {
+    BACK_SENDS_ESCAPE.store(on, std::sync::atomic::Ordering::Release);
+}
+
+fn back_sends_escape() -> bool {
+    BACK_SENDS_ESCAPE.load(std::sync::atomic::Ordering::Acquire)
+}
+
+/// Ask the Android activity to finish, tearing the app down through the
+/// normal lifecycle (Destroy → `platform.quit()` → `android_main` returns).
+/// BACK-to-exit flows call this after the reader confirms; plain
+/// `Application::quit` ends the gpui loop but leaves the activity alive.
+pub fn finish_activity() {
+    let result = with_env(|env| {
+        let activity = activity(env)?;
+        env.call_method(&activity, jni::jni_str!("finish"), jni::jni_sig!("()V"), &[])
+            .map(|_| ())
+            .map_err(|e: jni::errors::Error| e.to_string())
+    });
+    if let Err(e) = result {
+        log::warn!("finish_activity: {e}");
     }
 }
